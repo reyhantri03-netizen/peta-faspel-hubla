@@ -333,6 +333,7 @@ let faspelFilter = 'all';
 let auditorFilter = 'all';
 let statusFilter = 'all'; // filter status auditor: all | aktif | nonaktif (Pensiun/Meninggal Dunia)
 let tuksTersusFilter = 'all';
+let faspelComplyFilter = 'all'; // filter sebaran Faspel di tab TUKS & TERSUS: all | comply | sementara | expired | belum
 let selectedAuditorKey = null; // when set, sidebar shows full auditor list for that location
 let selectedGroupKey = null;
 
@@ -373,6 +374,26 @@ const FASPEL_COMPLY_COLOR = {
   'Expired': '#e0483e',
 };
 function faspelComplyColor(f){ return FASPEL_COMPLY_COLOR[f.status] || '#8a97a3'; }
+function faspelComplyCategory(f){
+  if(f.status === 'Sudah Update IMO GISIS') return 'comply';
+  if(f.status === 'SoCPF Sementara') return 'sementara';
+  if(f.status === 'Expired') return 'expired';
+  return 'belum';
+}
+// Peta id TUKS/TERSUS -> kategori kepatuhan Faspel yang cocok dengannya (dipakai mode "Faspel Belum Comply")
+let TT_COMPLY_MAP = null;
+function buildTTComplyMap(){
+  TT_COMPLY_MAP = {};
+  FASPEL.forEach(f=>{
+    if(f.tuks_tersus_match){
+      TT_COMPLY_MAP[f.tuks_tersus_match.id] = faspelComplyCategory(f);
+    }
+  });
+}
+function ttComplyColor(t){
+  if(!TT_COMPLY_MAP) buildTTComplyMap();
+  return TT_COMPLY_MAP[t.id] === 'comply' ? MATCH_COLOR : '#8a97a3';
+}
 function jenisColor(j){ return JENIS_COLOR[j] || '#8a97a3'; }
 function statusColor(s){ return STATUS_COLOR[s] || '#8a97a3'; }
 function tipeColor(t){ return TIPE_COLOR[t] || '#8a97a3'; }
@@ -572,6 +593,20 @@ function setupFilterOptions(){
       const o = document.createElement('option'); o.value=v; o.textContent=l; statusSel.appendChild(o);
     });
     statusSel.value = statusFilter;
+  } else if(activeTab === 'tuks_tersus'){
+    statusSel.style.display = '';
+    statusSel.innerHTML = '';
+    const fopts = [
+      ['all','Semua Status Faspel'],
+      ['comply','Faspel Comply'],
+      ['sementara','Faspel Sementara'],
+      ['expired','Faspel Expired'],
+      ['belum','Faspel Belum Comply'],
+    ];
+    fopts.forEach(([v,l])=>{
+      const o = document.createElement('option'); o.value=v; o.textContent=l; statusSel.appendChild(o);
+    });
+    statusSel.value = faspelComplyFilter;
   } else {
     statusSel.style.display = 'none';
   }
@@ -584,8 +619,8 @@ document.getElementById('filterSelect').addEventListener('change', (e)=>{
   render();
 });
 document.getElementById('statusFilterSelect').addEventListener('change', (e)=>{
-  statusFilter = e.target.value;
-  selectedAuditorKey = null;
+  if(activeTab === 'tuks_tersus'){ faspelComplyFilter = e.target.value; renderMiniLegend(); }
+  else { statusFilter = e.target.value; selectedAuditorKey = null; }
   render();
 });
 document.getElementById('searchInput').addEventListener('input', (e)=>{
@@ -733,26 +768,91 @@ function groupTuksTersus(list){
 function renderTuksTersus(){
   const filtered = getFilteredTuksTersus();
   const groups = groupTuksTersus(filtered);
+  buildTTComplyMap();
+  const belumMode = faspelComplyFilter === 'belum';           // mode 2 warna: seluruh TUKS/TERSUS diwarnai sesuai kepatuhan Faspel-nya
+  const faspelOnlyMode = faspelComplyFilter !== 'all' && !belumMode; // mode filter comply/sementara/expired: TUKS/TERSUS disembunyikan
 
   markerLayer.clearLayers();
   markerIndex = {};
-  filtered.forEach(t=>{
-    const marker = L.marker([t.lat, t.lon], {icon: buildingIcon(tipeColor(t.tipe), 22, false)});
-    marker.bindPopup(tuksTersusPopupHtml(t), {maxWidth:280, minWidth:220});
-    markerLayer.addLayer(marker);
-    markerIndex['tt_'+t.id] = marker;
-  });
 
-  // Sebaran Faspel (hanya di tab ini): hijau=comply, kuning=sementara, merah=expired, abu-abu=belum comply
-  FASPEL.forEach(f=>{
-    const marker = L.marker([f.lat, f.lon], {icon: buildingIcon(faspelComplyColor(f), 13, false)});
+  if(belumMode){
+    // Tampilkan SEMUA TUKS/TERSUS, hanya 2 warna: hijau = ada Faspel comply yang cocok, abu-abu = belum comply
+    filtered.forEach(t=>{
+      const marker = L.marker([t.lat, t.lon], {icon: buildingIcon(ttComplyColor(t), 20, false)});
+      marker.bindPopup(tuksTersusPopupHtml(t), {maxWidth:280, minWidth:220});
+      markerLayer.addLayer(marker);
+      markerIndex['tt_'+t.id] = marker;
+    });
+  } else if(!faspelOnlyMode){
+    filtered.forEach(t=>{
+      const marker = L.marker([t.lat, t.lon], {icon: buildingIcon(tipeColor(t.tipe), 22, false)});
+      marker.bindPopup(tuksTersusPopupHtml(t), {maxWidth:280, minWidth:220});
+      markerLayer.addLayer(marker);
+      markerIndex['tt_'+t.id] = marker;
+    });
+  }
+
+  // Sebaran Faspel: disembunyikan total pada mode "belum" (supaya cuma 2 warna di peta)
+  const shownFaspelList = belumMode ? [] : FASPEL.filter(f => faspelComplyFilter === 'all' || faspelComplyCategory(f) === faspelComplyFilter);
+  shownFaspelList.forEach(f=>{
+    const marker = L.marker([f.lat, f.lon], {icon: buildingIcon(faspelComplyColor(f), faspelOnlyMode ? 22 : 13, false)});
     marker.bindPopup(faspelPopupHtml(f), {maxWidth:280, minWidth:220});
     markerLayer.addLayer(marker);
     markerIndex['fp_'+f.no] = marker;
   });
 
   const listWrap = document.getElementById('listWrap');
-  if(groups.length === 0){
+  if(belumMode){
+    // Daftar seluruh TUKS/TERSUS dengan dot hijau/abu-abu sesuai kepatuhan
+    if(filtered.length === 0){
+      listWrap.innerHTML = `<div class="list-empty">Tidak ada data TUKS/TERSUS yang cocok dengan pencarian/filter ini.</div>`;
+    } else {
+      listWrap.innerHTML = filtered.map(t=>`
+        <div class="list-item" data-tt="${t.id}">
+          <span class="li-dot" style="background:${ttComplyColor(t)}"></span>
+          <div class="li-main">
+            <div class="li-title">${t.namobj}</div>
+            <div class="li-sub">${t.tipe} · ${t.nama_pp}</div>
+          </div>
+        </div>
+      `).join('');
+      listWrap.querySelectorAll('.list-item').forEach(el=>{
+        el.addEventListener('click', ()=>{
+          const id = Number(el.getAttribute('data-tt'));
+          const t = filtered.find(x=>x.id===id);
+          if(!t) return;
+          map.setView([t.lat, t.lon], 12, {animate:true});
+          const marker = markerIndex['tt_'+t.id];
+          setTimeout(()=>{ if(marker) marker.openPopup(); }, 300);
+        });
+      });
+    }
+  } else if(faspelOnlyMode){
+    // Mode khusus: tampilkan daftar Faspel yang lolos filter, bukan daftar instansi TUKS/TERSUS
+    if(shownFaspelList.length === 0){
+      listWrap.innerHTML = `<div class="list-empty">Tidak ada Faspel dengan status ini.</div>`;
+    } else {
+      listWrap.innerHTML = shownFaspelList.map(f=>`
+        <div class="list-item" data-fp="${f.no}">
+          <span class="li-dot" style="background:${faspelComplyColor(f)}"></span>
+          <div class="li-main">
+            <div class="li-title">${f.facility}</div>
+            <div class="li-sub">${f.port}</div>
+          </div>
+        </div>
+      `).join('');
+      listWrap.querySelectorAll('.list-item').forEach(el=>{
+        el.addEventListener('click', ()=>{
+          const no = el.getAttribute('data-fp');
+          const f = shownFaspelList.find(x=>String(x.no)===no);
+          if(!f) return;
+          map.setView([f.lat, f.lon], 12, {animate:true});
+          const marker = markerIndex['fp_'+f.no];
+          setTimeout(()=>{ if(marker) marker.openPopup(); }, 300);
+        });
+      });
+    }
+  } else if(groups.length === 0){
     listWrap.innerHTML = `<div class="list-empty">Tidak ada data TUKS/TERSUS yang cocok dengan pencarian/filter ini.</div>`;
   } else {
     listWrap.innerHTML = groups.map(g=>`
@@ -770,11 +870,22 @@ function renderTuksTersus(){
     });
   }
 
-  document.getElementById('totalLabel').textContent = 'Total Titik';
-  document.getElementById('totalValue').textContent = filtered.length;
-  const nT = filtered.filter(t=>t.tipe==='TERSUS').length;
-  const nU = filtered.filter(t=>t.tipe==='TUKS').length;
-  document.getElementById('totalSub').textContent = `${nT} TERSUS · ${nU} TUKS · ${groups.length} instansi pengawas · +${FASPEL.length} titik Faspel`;
+  if(belumMode){
+    const nComply = filtered.filter(t=>ttComplyColor(t)===MATCH_COLOR).length;
+    document.getElementById('totalLabel').textContent = 'Total TUKS/TERSUS';
+    document.getElementById('totalValue').textContent = filtered.length;
+    document.getElementById('totalSub').textContent = `${nComply} sudah comply (hijau) · ${filtered.length-nComply} belum comply (abu-abu)`;
+  } else if(faspelOnlyMode){
+    document.getElementById('totalLabel').textContent = 'Total Faspel';
+    document.getElementById('totalValue').textContent = shownFaspelList.length;
+    document.getElementById('totalSub').textContent = 'TUKS & TERSUS disembunyikan karena filter status Faspel aktif';
+  } else {
+    document.getElementById('totalLabel').textContent = 'Total Titik';
+    document.getElementById('totalValue').textContent = filtered.length;
+    const nT = filtered.filter(t=>t.tipe==='TERSUS').length;
+    const nU = filtered.filter(t=>t.tipe==='TUKS').length;
+    document.getElementById('totalSub').textContent = `${nT} TERSUS · ${nU} TUKS · ${groups.length} instansi pengawas · +${shownFaspelList.length} titik Faspel`;
+  }
 }
 
 function tuksTersusPopupHtml(t){
@@ -1021,14 +1132,21 @@ function renderMiniLegend(){
       ['Cocok TUKS/TERSUS', MATCH_COLOR],
     ];
   } else if(activeTab === 'tuks_tersus'){
-    items = [
-      ['TERSUS', TIPE_COLOR['TERSUS']],
-      ['TUKS', TIPE_COLOR['TUKS']],
-      ['Faspel comply', FASPEL_COMPLY_COLOR['Sudah Update IMO GISIS']],
-      ['Faspel sementara', FASPEL_COMPLY_COLOR['SoCPF Sementara']],
-      ['Faspel expired', FASPEL_COMPLY_COLOR['Expired']],
-      ['Faspel belum comply', '#8a97a3'],
-    ];
+    if(faspelComplyFilter === 'belum'){
+      items = [
+        ['Faspel comply', MATCH_COLOR],
+        ['Belum comply', '#8a97a3'],
+      ];
+    } else {
+      items = [
+        ['TERSUS', TIPE_COLOR['TERSUS']],
+        ['TUKS', TIPE_COLOR['TUKS']],
+        ['Faspel comply', FASPEL_COMPLY_COLOR['Sudah Update IMO GISIS']],
+        ['Faspel sementara', FASPEL_COMPLY_COLOR['SoCPF Sementara']],
+        ['Faspel expired', FASPEL_COMPLY_COLOR['Expired']],
+        ['Faspel belum comply', '#8a97a3'],
+      ];
+    }
   } else {
     items = [
       ['Sudah ada auditor', AUDITOR_HAS_COLOR],
