@@ -322,7 +322,7 @@
 const FASPEL_INITIAL = JSON.parse(document.getElementById('faspel-data').textContent);
 const AUDITOR_INITIAL = JSON.parse(document.getElementById('auditor-data').textContent);
 const TUKS_TERSUS_INITIAL = JSON.parse(document.getElementById('tuks-tersus-data').textContent);
-const UPT_NO_AUDITOR = JSON.parse(document.getElementById('upt-no-auditor-data').textContent);
+let UPT_NO_AUDITOR = JSON.parse(document.getElementById('upt-no-auditor-data').textContent);
 const RSO_INITIAL = JSON.parse(document.getElementById('rso-data').textContent);
 let RSO = RSO_INITIAL.slice();
 const PORT_COORDS = JSON.parse(document.getElementById('port-coords-data').textContent);
@@ -1478,12 +1478,347 @@ function parseDmsToken(tok){
 }
 function inBoundsIdn(lat,lon){ return lat>=-11.5 && lat<=6.5 && lon>=94 && lon<=141.5; }
 
+// ===================== IMPOR DATA DARI EXCEL (template Data Master) =====================
+// Kolom dibaca berdasarkan JUDUL kolom (bukan posisi), sehingga urutan kolom boleh berubah.
+// Satu file bisa berisi beberapa sheet sekaligus: FASPEL, AUDITOR, TUKS_TERSUS, RSO, UPT.
+// File lama (format posisi kolom) tetap didukung sebagai cadangan.
+const DATA_MASTER_FILE = 'Data_Master_Peta.xlsx';
+const MONTHS_EN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const MONTHS_ID = {jan:0,feb:1,mar:2,apr:3,may:4,mei:4,jun:5,jul:6,aug:7,agu:7,agt:7,sep:8,oct:9,okt:9,nov:10,dec:11,des:11};
+
+function normHeader(h){ return String(h==null?'':h).toLowerCase().replace(/[^a-z0-9]/g,''); }
+function cellStr(v){
+  if(v===null || v===undefined) return '';
+  if(v instanceof Date) return excelDateToStr(v);
+  return String(v).trim();
+}
+function toDate(v){
+  if(v instanceof Date){
+    // SheetJS memberi tanggal dalam waktu lokal (kadang meleset beberapa detik) -> geser 12 jam agar hari tidak bergeser
+    const d = new Date(v.getTime() + 12*3600*1000);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+  if(v===null || v===undefined) return null;
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})[\s\-\/]+([A-Za-z]{3})[A-Za-z]*\.?[\s\-\/]+(\d{4})$/);
+  if(m && MONTHS_ID[m[2].toLowerCase()]!==undefined) return new Date(+m[3], MONTHS_ID[m[2].toLowerCase()], +m[1]);
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(m) return new Date(+m[1], +m[2]-1, +m[3]);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(m) return new Date(+m[3], +m[2]-1, +m[1]);
+  return null;
+}
 function excelDateToStr(v){
   if(v===null||v===undefined||v==='') return '-';
   if(v instanceof Date){
-    return v.toLocaleDateString('id-ID',{day:'2-digit',month:'short',year:'numeric'});
+    const d = toDate(v);
+    return String(d.getDate()).padStart(2,'0')+' '+MONTHS_EN[d.getMonth()]+' '+d.getFullYear();
   }
-  return String(v);
+  return String(v).trim() || '-';
+}
+function dateIso(v){
+  const d = toDate(v);
+  if(!d || isNaN(d)) return null;
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+// Koordinat: angka desimal (-6.30, "106,68" juga diterima) ATAU format derajat dengan arah mata angin (4°49'35.8"S)
+function parseCoord(v){
+  if(v===null || v===undefined || v==='') return null;
+  if(typeof v === 'number') return isFinite(v) ? v : null;
+  const s = String(v).trim();
+  if(/^-?\d+([.,]\d+)?$/.test(s)) return parseFloat(s.replace(',','.'));
+  return parseDmsToken(s);
+}
+// Satu sel berisi "lat, lon" (desimal) atau dua token derajat
+function parseCoordPair(v){
+  if(v===null || v===undefined) return [null,null];
+  const s = String(v).trim();
+  const dec = s.match(/(-?\d+\.\d+)\s*[,;]\s*(-?\d+\.\d+)/);
+  if(dec) return [parseFloat(dec[1]), parseFloat(dec[2])];
+  const toks = s.match(/[\d°'".\s]+[NSEW]/gi);
+  if(toks && toks.length===2) return [parseDmsToken(toks[0].trim()), parseDmsToken(toks[1].trim())];
+  return [null,null];
+}
+function isYes(v){ return /^(ya|y|yes|true|1)$/i.test(cellStr(v)); }
+
+// Cari baris judul (dalam 6 baris pertama) lalu kembalikan pembaca kolom berdasarkan alias judul
+function sheetTable(ws, required){
+  const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:false});
+  for(let h=0; h<Math.min(6, rows.length); h++){
+    const idx = {};
+    (rows[h]||[]).forEach((v,i)=>{ const k = normHeader(v); if(k && idx[k]===undefined) idx[k]=i; });
+    if(required.every(alts=> alts.some(a=> idx[a]!==undefined))){
+      const col = alts => { for(const a of alts){ if(idx[a]!==undefined) return idx[a]; } return -1; };
+      return { rows: rows.slice(h+1), col };
+    }
+  }
+  return null;
+}
+function findSheet(wb, re){ const n = wb.SheetNames.find(s=>re.test(s)); return n ? wb.Sheets[n] : null; }
+const get = (r,i) => (i>=0 && r) ? r[i] : null;
+
+// ---------- FASPEL ----------
+const H_FASPEL = {
+  no:['no'], port:['pelabuhan','namapelabuhan'], facility:['namafaspel','namafasilitaspelabuhan','namafasilitas'],
+  imo:['imoportfacilityno','imoportfacilitynumber','imopfnumber','imo'], desc:['deskripsi','deskripsijeniskapaldilayani'],
+  initial:['initialapproval','tanggalinitialapproval'], review:['reviewdate','tanggalreview'],
+  issue:['socpfissue','tanggalterbitsocpf'], exp:['expdatesocpf','expdate','tanggalkedaluwarsa'],
+  status:['status','keteranganstatus','keterangan'], cert:['nomorsertifikat','nosertifikatsocpf','nosertifikat'],
+  lat:['latitude','lintang'], lon:['longitude','bujur'], src:['sumberkoordinat'],
+  gm:['diverifikasiviagooglemaps','diverifikasigooglemaps'], gmname:['namadigooglemaps']
+};
+function importFaspel(ws){
+  let t = sheetTable(ws, [H_FASPEL.port, H_FASPEL.facility]);
+  let col;
+  if(t){ col = k => t.col(H_FASPEL[k]); }
+  else { // format lama: posisi kolom tetap
+    const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:false});
+    const pos = {no:0,port:1,facility:2,imo:3,desc:4,initial:5,review:6,issue:7,exp:8,status:9,cert:10,lat:11,lon:12};
+    t = { rows: rows.slice(1) }; col = k => (pos[k]===undefined ? -1 : pos[k]);
+  }
+  const C = {}; Object.keys(H_FASPEL).forEach(k=> C[k]=col(k));
+  // Nomor IMO -> daftar Faspel bawaan yang koordinatnya sudah TERVERIFIKASI (cocok TUKS/TERSUS atau Google Maps).
+  // Satu nomor IMO kadang dipakai >1 fasilitas, jadi bila ada lebih dari satu, nama fasilitas juga harus sama.
+  const verifiedByImo = {};
+  FASPEL_INITIAL.forEach(f=>{
+    if(f.imo && (f.tuks_tersus_match || f.gmaps_verified)) (verifiedByImo[String(f.imo).trim().toUpperCase()] ||= []).push(f);
+  });
+  const allByImo = {};
+  FASPEL_INITIAL.forEach(f=>{ if(f.imo) (allByImo[String(f.imo).trim().toUpperCase()] ||= []).push(f); });
+  const normName = s => String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  const verifiedNoImo = FASPEL_INITIAL.filter(f=> !f.imo && (f.tuks_tersus_match || f.gmaps_verified));
+  const findVerified = (imoKey, facility) => {
+    if(!imoKey) return verifiedNoImo.find(f=> normName(f.facility)===normName(facility)) || null; // fasilitas tanpa nomor IMO: cocokkan nama
+    const list = verifiedByImo[imoKey]; if(!list) return null;
+    const same = list.find(f=> normName(f.facility)===normName(facility));
+    if(same) return same;
+    return (allByImo[imoKey]||[]).length===1 ? list[0] : null;
+  };
+  const out = []; let nProtected = 0;
+  t.rows.forEach(r=>{
+    const port = cellStr(get(r,C.port));
+    if(!port) return;
+    const imo = cellStr(get(r,C.imo)) || null;
+    const imoKey = imo ? imo.toUpperCase() : '';
+    let lat = parseCoord(get(r,C.lat)), lon = parseCoord(get(r,C.lon));
+    const srcCell = cellStr(get(r,C.src)).toLowerCase();
+    const gm = isYes(get(r,C.gm));
+    let source = 'precise', ttMatch = null, gmapsVerified = false, gmapsName = null;
+    const okCoord = lat!==null && lon!==null && inBoundsIdn(lat,lon);
+    const verified = findVerified(imoKey, get(r,C.facility));
+    if(gm && okCoord){
+      // Ditandai terverifikasi Google Maps di Excel -> koordinat Excel dipakai (cara mengganti titik yang terkunci)
+      gmapsVerified = true; gmapsName = cellStr(get(r,C.gmname)) || null;
+    } else if(verified){
+      // Nomor IMO sudah terverifikasi -> koordinat dikunci (mencegah tertimpa data lama/usang)
+      lat = verified.lat; lon = verified.lon;
+      ttMatch = verified.tuks_tersus_match || null;
+      gmapsVerified = !!verified.gmaps_verified; gmapsName = verified.gmaps_name || null;
+      nProtected++;
+    }
+    if(!ttMatch && !gmapsVerified){
+      if(!okCoord){
+        // koordinat kosong/tidak valid -> titik estimasi di lokasi pelabuhan
+        const fb = PORT_COORDS[port];
+        if(fb){ lat = fb[0]; lon = fb[1]; } else { lat=-2.0; lon=118.0; }
+        source = 'estimasi';
+      } else if(srcCell==='estimasi'){
+        source = 'estimasi'; // titik dari Excel tetap dipakai, ditandai sebagai estimasi
+      }
+    }
+    const ket = cellStr(get(r,C.status));
+    const status = (ket==='SoCPF Sementara' || ket==='Expired') ? ket : 'Sudah Update IMO GISIS';
+    const expRaw = get(r,C.exp);
+    const rec = {
+      no:get(r,C.no) ?? out.length+1, port, facility:cellStr(get(r,C.facility)), imo, desc:cellStr(get(r,C.desc)),
+      initial_approval:excelDateToStr(get(r,C.initial)), review_date:excelDateToStr(get(r,C.review)),
+      socpf_issue:excelDateToStr(get(r,C.issue)), exp_date:excelDateToStr(expRaw), exp_date_iso:dateIso(expRaw),
+      status, cert_no:cellStr(get(r,C.cert)), lat, lon, coord_source:source,
+    };
+    if(ttMatch) rec.tuks_tersus_match = ttMatch;
+    if(gmapsVerified){ rec.gmaps_verified = true; if(gmapsName) rec.gmaps_name = gmapsName; }
+    out.push(rec);
+  });
+  return out.length ? { data:out, nProtected } : null;
+}
+
+// ---------- AUDITOR ----------
+const H_AUD = {
+  no:['no'], nama:['nama','namaauditor','namalengkap'], nip:['nip'], pangkat:['pangkatgolongan','pangkat'], golongan:['golongan'],
+  unit:['unitkerja','uptunitkerja'], prov:['provinsi'], jenis:['jenisunit'], jabatan:['jabatansaatini','jabatan'],
+  id:['idauditor'], tahun:['tahunsertifikasi'], status:['status'], upt:['uptresmiterkaitdari296','uptresmiterkait','upt'],
+  maps:['linkgooglemaps','googlemaps'], lat:['latitude','lintang'], lon:['longitude','bujur'],
+  coord:['koordinatlatlon','koordinat'], src:['sumberkoordinat']
+};
+function importAuditor(ws){
+  let t = sheetTable(ws, [H_AUD.nama, H_AUD.unit]);
+  let col;
+  if(t){ col = k => t.col(H_AUD[k]); }
+  else {
+    const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:false});
+    const pos = {no:0,nama:1,nip:2,pangkat:3,golongan:4,unit:5,prov:6,jenis:7,jabatan:8,id:9,tahun:10,status:11,maps:12,coord:13};
+    t = { rows: rows.slice(1) }; col = k => (pos[k]===undefined ? -1 : pos[k]);
+  }
+  const C = {}; Object.keys(H_AUD).forEach(k=> C[k]=col(k));
+  const out = [];
+  t.rows.forEach(r=>{
+    const nama = cellStr(get(r,C.nama));
+    if(!nama) return;
+    const prov = cellStr(get(r,C.prov)) || 'Lainnya/Belum Terpetakan';
+    let lat = parseCoord(get(r,C.lat)), lon = parseCoord(get(r,C.lon));
+    if((lat===null || lon===null) && C.coord>=0) [lat,lon] = parseCoordPair(get(r,C.coord));
+    let source = cellStr(get(r,C.src)).toLowerCase()==='estimasi' ? 'estimasi' : 'precise';
+    if(lat===null || lon===null || !inBoundsIdn(lat,lon)){
+      const fb = PROVINCE_COORDS[prov] || PROVINCE_COORDS['Lainnya/Belum Terpetakan'];
+      lat = fb[0]; lon = fb[1]; source = 'estimasi';
+    }
+    const upt = cellStr(get(r,C.upt));
+    out.push({
+      no:get(r,C.no) ?? out.length+1, nama, nip:cellStr(get(r,C.nip)), pangkat_golongan:cellStr(get(r,C.pangkat)), golongan:cellStr(get(r,C.golongan)),
+      unit_kerja:cellStr(get(r,C.unit)), provinsi:prov, jenis_unit:cellStr(get(r,C.jenis)) || 'Lainnya', jabatan:cellStr(get(r,C.jabatan)),
+      id_auditor:cellStr(get(r,C.id)), tahun_sertifikasi:get(r,C.tahun), status:cellStr(get(r,C.status)) || 'Aktif',
+      maps_url:cellStr(get(r,C.maps)) || null, lat, lon, coord_source:source,
+      // dikelompokkan per UPT resmi; auditor kantor pusat/diklat ("(Non-UPT ...)") tidak punya UPT
+      upt_no: (upt && !upt.startsWith('(')) ? upt.toUpperCase() : null,
+    });
+  });
+  return out.length ? { data:out } : null;
+}
+
+// ---------- TUKS / TERSUS ----------
+const H_TT = {
+  id:['id'], tipe:['tipe','jenis','tipetukstersus'], namobj:['namaperusahaanobjek','namaobjekperusahaan','namaobjek','namaterminal','namaperusahaan'],
+  kategori:['kategori'], nama_pp:['unitkerjapengawasnamapp','unitkerjapengawas','uptpengawas','namapp'], lokasi:['lokasi'],
+  alamat:['alamat','alamatperusahaan'], prov:['provinsi'], kabkot:['kabkota','kabupatenkota'], bdg:['bidangkegiatan','bidangusaha'],
+  status:['statusoperasi'], sk:['skpenetapanlokasi','noskpenetapanlokasi','noizinpenetapan'], pj:['penanggungjawab'],
+  lat:['latitude','lintang'], lon:['longitude','bujur']
+};
+function importTuksTersus(ws){
+  const t = sheetTable(ws, [H_TT.tipe, H_TT.namobj, H_TT.lat]);
+  if(!t) return null;
+  const C = {}; Object.keys(H_TT).forEach(k=> C[k]=t.col(H_TT[k]));
+  const out = []; let skipped = 0;
+  t.rows.forEach(r=>{
+    const namobj = cellStr(get(r,C.namobj));
+    if(!namobj) return;
+    const lat = parseCoord(get(r,C.lat)), lon = parseCoord(get(r,C.lon));
+    if(lat===null || lon===null || !inBoundsIdn(lat,lon)){ skipped++; return; }
+    const id = get(r,C.id);
+    out.push({
+      id: (id===null || id==='') ? 'x'+(out.length+1) : id, tipe:cellStr(get(r,C.tipe)).toUpperCase(), namobj,
+      kategori:cellStr(get(r,C.kategori)), nama_pp:cellStr(get(r,C.nama_pp)), lokasi:cellStr(get(r,C.lokasi)),
+      alamat:cellStr(get(r,C.alamat)), prov:cellStr(get(r,C.prov)), kabkot:cellStr(get(r,C.kabkot)), bdg_keg:cellStr(get(r,C.bdg)),
+      status_ope:cellStr(get(r,C.status)), sk_tap_lok:cellStr(get(r,C.sk)), penanggung:cellStr(get(r,C.pj)), lat, lon,
+    });
+  });
+  return out.length ? { data:out, skipped } : null;
+}
+
+// ---------- RSO ----------
+const H_RSO = {
+  no:['no'], nama:['namarso'], sk:['nomorsk'], terbit:['terbittanggal','tanggalterbitsk','tanggalsk'], berlaku:['berlakuhingga','skberlakuhingga'],
+  direktur:['direktur','namadirekturrso','namadirektur'], pj:['penanggungjawab','namapenanggungjawab'],
+  ta_keamanan:['tenagaahlikeamanan','tenagaahlibidangkeamanan'], ta_perkapalan:['tenagaahliperkapalan','tenagaahlibidangperkapalan'],
+  ta_kepelabuhanan:['tenagaahlikepelabuhanan','tenagaahlibidangkepelabuhanan'],
+  ta_mr:['tenagaahlimanajemenrisiko','tenagaahlibidangmanajemenrisiko'], ta_intelijen:['tenagaahliintelijen','tenagaahlibidangintelijen'],
+  email:['email','emailaktifrso'], alamat:['alamat','alamatrso','alamatkantor'], lat:['latitude','lintang'], lon:['longitude','bujur'],
+  coord:['koordinatalamatrso','koordinat'], src:['sumberkoordinat']
+};
+function importRso(ws){
+  const t = sheetTable(ws, [H_RSO.nama, H_RSO.sk]);
+  if(!t) return null;
+  const C = {}; Object.keys(H_RSO).forEach(k=> C[k]=t.col(H_RSO[k]));
+  const out = []; const noCoord = [];
+  t.rows.forEach(r=>{
+    const nama = cellStr(get(r,C.nama)).replace(/\s*\n\s*/g,' ');
+    if(!nama) return;
+    let lat = parseCoord(get(r,C.lat)), lon = parseCoord(get(r,C.lon));
+    if((lat===null || lon===null) && C.coord>=0) [lat,lon] = parseCoordPair(get(r,C.coord));
+    if(lat===null || lon===null || !inBoundsIdn(lat,lon)){ noCoord.push(nama); return; }
+    const tb = get(r,C.terbit), bh = get(r,C.berlaku);
+    out.push({
+      no:get(r,C.no) ?? out.length+1, nama_rso:nama, direktur:cellStr(get(r,C.direktur)),
+      ta_keamanan:cellStr(get(r,C.ta_keamanan)), ta_perkapalan:cellStr(get(r,C.ta_perkapalan)), ta_kepelabuhanan:cellStr(get(r,C.ta_kepelabuhanan)),
+      ta_manajemen_risiko:cellStr(get(r,C.ta_mr)), ta_intelijen:cellStr(get(r,C.ta_intelijen)), email:cellStr(get(r,C.email)),
+      alamat:cellStr(get(r,C.alamat)), penanggung_jawab:cellStr(get(r,C.pj)), nomor_sk:cellStr(get(r,C.sk)),
+      terbit:excelDateToStr(tb), berlaku_hingga:excelDateToStr(bh), lat, lon,
+      coord_source:cellStr(get(r,C.src)) || 'dari data', terbit_iso:dateIso(tb), berlaku_hingga_iso:dateIso(bh),
+    });
+  });
+  return out.length ? { data:out, noCoord } : null;
+}
+
+// ---------- UPT (daftar resmi) -> UPT tanpa auditor ----------
+function importUpt(ws){
+  const t = sheetTable(ws, [['namaupt'], ['statusauditor']]);
+  if(!t) return null;
+  const C = { name:t.col(['namaupt']), prov:t.col(['provinsi']), st:t.col(['statusauditor']), lat:t.col(['latitude','lintang']), lon:t.col(['longitude','bujur']) };
+  const out = []; let total = 0;
+  t.rows.forEach(r=>{
+    const name = cellStr(get(r,C.name));
+    if(!name) return;
+    total++;
+    if(!/belum/i.test(cellStr(get(r,C.st)))) return;
+    const lat = parseCoord(get(r,C.lat)), lon = parseCoord(get(r,C.lon));
+    if(lat===null || lon===null || !inBoundsIdn(lat,lon)) return;
+    out.push({ name, lat, lon, provinsi:cellStr(get(r,C.prov)) });
+  });
+  return total ? { data:out, total } : null;
+}
+
+// Baca seluruh sheet yang dikenali dari satu workbook dan terapkan ke peta
+function importWorkbook(wb, fallbackTab){
+  const res = {};
+  const wsTT = findSheet(wb, /tuks|tersus/i);
+  const wsF  = findSheet(wb, /faspel/i);
+  const wsA  = findSheet(wb, /auditor/i);
+  const wsR  = findSheet(wb, /^rso$|sebaran.?rso|tenaga.?ahli/i) || findSheet(wb, /rso/i);
+  const wsU  = findSheet(wb, /^upt/i);
+  if(wsTT) res.tuks = importTuksTersus(wsTT);
+  if(wsF)  res.faspel = importFaspel(wsF);
+  if(wsA)  res.auditor = importAuditor(wsA);
+  if(wsR)  res.rso = importRso(wsR);
+  if(wsU)  res.upt = importUpt(wsU);
+  // File satu sheet tanpa nama yang dikenali -> pakai sheet pertama untuk tab yang sedang aktif
+  if(!Object.values(res).some(Boolean) && fallbackTab){
+    const ws0 = wb.Sheets[wb.SheetNames[0]];
+    if(fallbackTab==='faspel') res.faspel = importFaspel(ws0);
+    else if(fallbackTab==='auditor') res.auditor = importAuditor(ws0);
+    else if(fallbackTab==='tuks_tersus') res.tuks = importTuksTersus(ws0);
+    else if(fallbackTab==='rso') res.rso = importRso(ws0);
+  }
+  return res;
+}
+
+function applyImported(res){
+  const msg = [];
+  if(res.tuks){
+    TUKS_TERSUS = res.tuks.data; _ttIdfCache = null;
+    msg.push(`${res.tuks.data.length} TUKS/TERSUS` + (res.tuks.skipped ? ` (${res.tuks.skipped} baris tanpa koordinat valid dilewati)` : ''));
+  }
+  if(res.faspel){
+    // Pencocokan otomatis TUKS/TERSUS hanya untuk fasilitas BARU (belum ada di data bawaan);
+    // fasilitas lama sudah ditinjau manual, jadi hasil tinjauannya tidak diubah.
+    const knownKey = f => String(f.imo||'').trim().toUpperCase()+'|'+String(f.facility||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    const known = new Set(FASPEL_INITIAL.map(knownKey));
+    const toMatch = res.faspel.data.filter(f=>!f.tuks_tersus_match && !f.gmaps_verified && !known.has(knownKey(f)));
+    const nMatched = autoMatchFaspelToTuksTersus(toMatch);
+    FASPEL = res.faspel.data;
+    msg.push(`${FASPEL.length} Faspel (${res.faspel.nProtected} koordinat terverifikasi dipertahankan, ${nMatched} otomatis cocok TUKS/TERSUS)`);
+  }
+  if(res.tuks || res.faspel) TT_COMPLY_MAP = null;
+  if(res.auditor){ AUDITOR = res.auditor.data; msg.push(`${AUDITOR.length} auditor`); }
+  if(res.upt){ UPT_NO_AUDITOR = res.upt.data; msg.push(`${res.upt.total} UPT`); }
+  if(res.rso){
+    RSO = res.rso.data;
+    msg.push(`${RSO.length} RSO` + (res.rso.noCoord.length ? ` (${res.rso.noCoord.length} tanpa koordinat valid dilewati: ${res.rso.noCoord.join(', ')})` : ''));
+  }
+  if(!msg.length) return null;
+  faspelFilter='all'; auditorFilter='all'; statusFilter='all'; tuksTersusFilter='all'; rsoStatusFilter='all';
+  searchQuery=''; selectedAuditorKey=null; selectedRsoKey=null; selectedGroupKey=null;
+  document.getElementById('searchInput').value='';
+  setupFilterOptions(); render();
+  return msg.join(', ');
 }
 
 document.getElementById('uploadBtn').addEventListener('click', ()=> document.getElementById('fileInput').click());
@@ -1493,112 +1828,39 @@ document.getElementById('fileInput').addEventListener('change', (e)=>{
   const reader = new FileReader();
   reader.onload = (evt)=>{
     try{
-      const wb = XLSX.read(evt.target.result, {type:'binary', cellDates:true});
-      if(activeTab === 'faspel'){
-        const sheetName = wb.SheetNames.find(n=>/faspel/i.test(n)) || wb.SheetNames[0];
-        const ws = wb.Sheets[sheetName];
-        const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:null, blankrows:false});
-        const newData = [];
-        // Peta nomor IMO -> data Faspel yang sudah TERVERIFIKASI (bawaan awal file, hasil pencocokan TUKS/TERSUS & Google Maps).
-        // Dipakai untuk melindungi koordinat yang sudah benar dari tertimpa data lama/usang saat upload ulang.
-        const verifiedByImo = {};
-        FASPEL_INITIAL.forEach(f=>{
-          if(f.imo && (f.tuks_tersus_match || f.gmaps_verified)) verifiedByImo[String(f.imo).trim().toUpperCase()] = f;
-        });
-        let nProtected = 0;
-        for(let i=1;i<rows.length;i++){
-          const r = rows[i];
-          if(!r || !r[1]) continue;
-          const port = String(r[1]).trim();
-          const imoKey = r[3] ? String(r[3]).trim().toUpperCase() : '';
-          const latRaw = r[11], lonRaw = r[12];
-          let lat = parseDmsToken(latRaw), lon = parseDmsToken(lonRaw);
-          let source = 'precise';
-          let ttMatch = null, gmapsVerified = false, gmapsName = null;
-
-          const verified = imoKey ? verifiedByImo[imoKey] : null;
-          if(verified){
-            // Nomor IMO ini sudah pernah terverifikasi (cocok TUKS/TERSUS atau Google Maps) -> KUNCI koordinatnya,
-            // berapa pun isi kolom koordinat pada file yang diupload (mencegah tertimpa data lama/usang tanpa sengaja).
-            lat = verified.lat; lon = verified.lon; source = 'precise';
-            ttMatch = verified.tuks_tersus_match || null;
-            gmapsVerified = !!verified.gmaps_verified;
-            gmapsName = verified.gmaps_name || null;
-            nProtected++;
-          }
-          if(lat===null || lon===null || !inBoundsIdn(lat,lon)){
-            const fallback = PORT_COORDS[port];
-            if(fallback){ lat = fallback[0]; lon = fallback[1]; } else { lat=-2.0; lon=118.0; }
-            source = 'estimasi';
-          }
-          const ket = (r[9]||'').toString().trim();
-          const status = (ket==='SoCPF Sementara' || ket==='Expired') ? ket : 'Sudah Update IMO GISIS';
-          const rec = {
-            no:r[0], port, facility:r[2]||'', imo:r[3], desc:r[4],
-            initial_approval:excelDateToStr(r[5]), review_date:excelDateToStr(r[6]),
-            socpf_issue:excelDateToStr(r[7]), exp_date:excelDateToStr(r[8]),
-            status, cert_no:r[10], lat, lon, coord_source:source,
-          };
-          if(ttMatch) rec.tuks_tersus_match = ttMatch;
-          if(gmapsVerified){ rec.gmaps_verified = true; if(gmapsName) rec.gmaps_name = gmapsName; }
-          newData.push(rec);
-        }
-        if(newData.length === 0){ showToast('Tidak ada baris valid ditemukan di file ini.', 'error'); return; }
-        const nMatched = autoMatchFaspelToTuksTersus(newData.filter(f=>!f.tuks_tersus_match));
-        FASPEL = newData;
-        faspelFilter = 'all'; searchQuery=''; document.getElementById('searchInput').value='';
-        setupFilterOptions(); render();
-        showToast(`Berhasil memuat ${newData.length} data faspel. ${nMatched} otomatis cocok TUKS/TERSUS, ${nProtected} koordinat terverifikasi tetap dipertahankan.`);
-      } else {
-        const sheetName = wb.SheetNames.find(n=>/auditor/i.test(n)) || wb.SheetNames[0];
-        const ws = wb.Sheets[sheetName];
-        const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:null, blankrows:false});
-        const newData = [];
-        for(let i=1;i<rows.length;i++){
-          const r = rows[i];
-          if(!r || !r[1]) continue;
-          const prov = (r[6]||'Lainnya/Belum Terpetakan').toString().trim();
-          const coord = r[13];
-          let lat=null, lon=null, source='estimasi';
-          if(coord){
-            const s = String(coord).trim();
-            const dec = s.match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
-            if(dec){ lat=parseFloat(dec[1]); lon=parseFloat(dec[2]); }
-            else {
-              const toks = s.match(/[\d°'".]+[NSEW]/gi);
-              if(toks && toks.length===2){ lat=parseDmsToken(toks[0]); lon=parseDmsToken(toks[1]); }
-            }
-          }
-          if(lat===null || lon===null || !inBoundsIdn(lat,lon)){
-            const fb = PROVINCE_COORDS[prov] || PROVINCE_COORDS['Lainnya/Belum Terpetakan'];
-            lat = fb[0]; lon = fb[1]; source='estimasi';
-          } else { source = 'precise'; }
-          newData.push({
-            no:r[0], nama:r[1]||'', nip:r[2], pangkat_golongan:r[3], golongan:r[4],
-            unit_kerja:r[5], provinsi:prov, jenis_unit:r[7]||'Lainnya', jabatan:r[8],
-            id_auditor:r[9], tahun_sertifikasi:r[10], status:r[11]||'Aktif', maps_url:r[12],
-            lat, lon, coord_source:source,
-          });
-        }
-        if(newData.length === 0){ showToast('Tidak ada baris valid ditemukan di file ini.', 'error'); return; }
-        AUDITOR = newData;
-        auditorFilter='all'; statusFilter='all'; searchQuery=''; selectedAuditorKey=null; document.getElementById('searchInput').value='';
-        setupFilterOptions(); render();
-        showToast(`Berhasil memuat ${newData.length} data auditor dari file baru.`);
-      }
+      const wb = XLSX.read(new Uint8Array(evt.target.result), {type:'array', cellDates:true});
+      const summary = applyImported(importWorkbook(wb, activeTab));
+      if(!summary){ showToast('Tidak ada sheet/baris data yang dikenali di file ini. Pastikan memakai template Data Master.', 'error'); }
+      else showToast('Berhasil memuat: ' + summary + '. (Hanya tampil di browser ini — untuk update permanen, ganti file '+DATA_MASTER_FILE+' di GitHub.)');
     } catch(err){
       console.error(err);
-      showToast('Gagal membaca file. Pastikan formatnya sesuai.', 'error');
+      showToast('Gagal membaca file. Pastikan formatnya sesuai template Data Master.', 'error');
     }
     e.target.value = '';
   };
-  reader.readAsBinaryString(file);
+  reader.readAsArrayBuffer(file);
 });
+
+// Muat otomatis Data_Master_Peta.xlsx dari folder yang sama (GitHub Pages) setiap peta dibuka.
+// Jika file tidak ada / gagal dibaca, peta tetap memakai data bawaan di dalam HTML ini.
+function autoLoadDataMaster(){
+  if(location.protocol === 'file:') return;
+  fetch(DATA_MASTER_FILE, {cache:'no-cache'})
+    .then(r => r.ok ? r.arrayBuffer() : null)
+    .then(buf => {
+      if(!buf) return;
+      const wb = XLSX.read(new Uint8Array(buf), {type:'array', cellDates:true});
+      const summary = applyImported(importWorkbook(wb, null));
+      if(summary) console.info('Data dimuat dari ' + DATA_MASTER_FILE + ': ' + summary);
+    })
+    .catch(err => console.warn('Data master tidak dimuat, memakai data bawaan:', err));
+}
 
 // ===================== INIT =====================
 setupFilterOptions();
 renderMiniLegend();
 render();
+autoLoadDataMaster();
 
 </script>
 </body>
